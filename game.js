@@ -3,13 +3,12 @@ const ctx = canvas.getContext('2d');
 
 const keys = new Set();
 let walkMask = null;
-let showDebugMask = false;
 let ready = false;
 
 const state = {
   x: 0,
   y: 0,
-  speed: 130,
+  speed: 120,
   direction: 'down',
   frame: 0,
   frameTimer: 0,
@@ -28,10 +27,6 @@ window.addEventListener('keydown', (event) => {
     event.preventDefault();
     keys.add(event.key);
   }
-
-  if (event.key.toLowerCase() === 'm') {
-    showDebugMask = !showDebugMask;
-  }
 });
 
 window.addEventListener('keyup', (event) => {
@@ -49,8 +44,8 @@ async function start() {
 }
 
 function showLoadError(message) {
-  canvas.width = 1100;
-  canvas.height = 620;
+  canvas.width = 960;
+  canvas.height = 540;
   ctx.fillStyle = '#0f1420';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = '#f8d7da';
@@ -82,7 +77,6 @@ async function loadFirstAvailable(paths) {
       // Try next candidate.
     }
   }
-
   throw new Error(`Could not load any image from: ${paths.join(', ')}`);
 }
 
@@ -96,7 +90,16 @@ function init(mapImage, spriteSheet) {
   const octx = offscreen.getContext('2d');
   octx.drawImage(mapImage, 0, 0);
 
-  walkMask = buildWalkMask(octx, offscreen.width, offscreen.height);
+  const data = octx.getImageData(0, 0, offscreen.width, offscreen.height).data;
+  walkMask = new Uint8Array(offscreen.width * offscreen.height);
+
+  for (let y = 0; y < offscreen.height; y++) {
+    for (let x = 0; x < offscreen.width; x++) {
+      const i = (y * offscreen.width + x) * 4;
+      const lum = (data[i] + data[i + 1] + data[i + 2]) / 3;
+      walkMask[y * offscreen.width + x] = lum > 125 ? 1 : 0;
+    }
+  }
 
   const spawn = findSpawn(offscreen.width, offscreen.height);
   state.x = spawn.x;
@@ -104,119 +107,6 @@ function init(mapImage, spriteSheet) {
 
   ready = true;
   requestAnimationFrame((ts) => loop(ts, mapImage, spriteSheet));
-}
-
-function buildWalkMask(context, width, height) {
-  const imageData = context.getImageData(0, 0, width, height);
-  const rgba = imageData.data;
-  const lum = new Float32Array(width * height);
-  const contrast = new Float32Array(width * height);
-  const raw = new Uint8Array(width * height);
-
-  const index = (x, y) => y * width + x;
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const i = (y * width + x) * 4;
-      const r = rgba[i];
-      const g = rgba[i + 1];
-      const b = rgba[i + 2];
-      lum[index(x, y)] = 0.299 * r + 0.587 * g + 0.114 * b;
-    }
-  }
-
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
-      let minL = 255;
-      let maxL = 0;
-
-      for (let oy = -1; oy <= 1; oy++) {
-        for (let ox = -1; ox <= 1; ox++) {
-          const l = lum[index(x + ox, y + oy)];
-          minL = Math.min(minL, l);
-          maxL = Math.max(maxL, l);
-        }
-      }
-
-      contrast[index(x, y)] = maxL - minL;
-    }
-  }
-
-  const BLACK_CUTOFF = 22;
-  const FLOOR_CUTOFF = 48;
-  const MAX_CONTRAST = 40;
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const idx = index(x, y);
-      raw[idx] = lum[idx] > FLOOR_CUTOFF && contrast[idx] < MAX_CONTRAST ? 1 : 0;
-    }
-  }
-
-  // Keep only regions connected to bright floor-like seeds, so walls are less likely to be walkable.
-  const finalMask = new Uint8Array(width * height);
-  const queue = [];
-
-  for (let y = 0; y < height; y += 8) {
-    for (let x = 0; x < width; x += 8) {
-      const idx = index(x, y);
-      if (lum[idx] > 80 && contrast[idx] < 26 && raw[idx]) {
-        queue.push(idx);
-        finalMask[idx] = 1;
-      }
-    }
-  }
-
-  while (queue.length > 0) {
-    const idx = queue.pop();
-    const x = idx % width;
-    const y = (idx / width) | 0;
-
-    const neighbors = [
-      [x + 1, y],
-      [x - 1, y],
-      [x, y + 1],
-      [x, y - 1],
-    ];
-
-    for (const [nx, ny] of neighbors) {
-      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-      const n = index(nx, ny);
-      if (finalMask[n]) continue;
-      if (!raw[n]) continue;
-      if (lum[n] <= BLACK_CUTOFF) continue;
-      finalMask[n] = 1;
-      queue.push(n);
-    }
-  }
-
-  // Erode twice so the character remains inside corridor contours.
-  return erode(erode(finalMask, width, height), width, height);
-}
-
-function erode(mask, width, height) {
-  const result = new Uint8Array(mask.length);
-
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
-      const idx = y * width + x;
-      if (!mask[idx]) continue;
-
-      let keep = true;
-      for (let oy = -1; oy <= 1 && keep; oy++) {
-        for (let ox = -1; ox <= 1; ox++) {
-          if (!mask[(y + oy) * width + (x + ox)]) {
-            keep = false;
-            break;
-          }
-        }
-      }
-
-      if (keep) result[idx] = 1;
-    }
-  }
-
-  return result;
 }
 
 function findSpawn(w, h) {
@@ -289,7 +179,7 @@ function update(dt, spriteSheet) {
     dx /= mag;
     dy /= mag;
 
-    const radius = Math.max(spriteSheet.width / 9 / 6, 4);
+    const radius = Math.max(spriteSheet.width / 9 / 5, 4);
     const move = state.speed * dt;
 
     const nx = state.x + dx * move;
@@ -313,19 +203,6 @@ function draw(mapImage, spriteSheet) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(mapImage, 0, 0);
 
-  if (showDebugMask) {
-    const maskData = ctx.createImageData(canvas.width, canvas.height);
-    for (let i = 0; i < walkMask.length; i++) {
-      if (!walkMask[i]) continue;
-      const j = i * 4;
-      maskData.data[j] = 0;
-      maskData.data[j + 1] = 255;
-      maskData.data[j + 2] = 120;
-      maskData.data[j + 3] = 70;
-    }
-    ctx.putImageData(maskData, 0, 0);
-  }
-
   const frameW = spriteSheet.width / 9;
   const frameH = spriteSheet.height / 4;
   const srcX = Math.floor(state.frame) * frameW;
@@ -342,11 +219,4 @@ function draw(mapImage, spriteSheet) {
     frameW,
     frameH
   );
-
-  ctx.fillStyle = 'rgba(5, 10, 25, 0.65)';
-  ctx.fillRect(10, 10, 220, 44);
-  ctx.fillStyle = '#d9e8ff';
-  ctx.font = '14px sans-serif';
-  ctx.fillText('Arrows: move', 18, 30);
-  ctx.fillText('M: toggle collision mask', 18, 48);
 }
