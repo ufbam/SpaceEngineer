@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Space Engineer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: monospace;
+  }
+  canvas { display: block; }
+  #hud {
+    position: fixed;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(180,220,180,0.5);
+    font-size: 11px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    pointer-events: none;
+  }
+  #loading {
+    position: fixed;
+    inset: 0;
+    background: #000;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: #4f8;
+    font-family: monospace;
+    font-size: 18px;
+    letter-spacing: 3px;
+    z-index: 10;
+    transition: opacity 0.5s;
+  }
+  #loading .bar-wrap {
+    width: 300px; height: 4px;
+    background: #111; border: 1px solid #4f8;
+    margin-top: 20px;
+  }
+  #loading .bar {
+    height: 100%; background: #4f8;
+    width: 0%; transition: width 0.3s;
+  }
+</style>
+</head>
+<body>
+<div id="loading">
+  <div>INITIALISING SYSTEMS</div>
+  <div class="bar-wrap"><div class="bar" id="loadbar"></div></div>
+</div>
+<canvas id="game"></canvas>
+<div id="hud">ARROW KEYS — MOVE</div>
+
+<script>
+// ─── CONFIG ────────────────────────────────────────────────────────────────
+const MAP_W = 2000, MAP_H = 1146;
+
+// Sprite sheet: 8 cols x 3 rows, 200x220px per frame, 1600x660 total
+// Row 0 = UP, Row 1 = DOWN, Row 2 = RIGHT (mirror for LEFT)
+const SPRITE_COLS = 9;
+const FRAME_W = 220;
+const FRAME_H = 260;
+
+// How large to draw the character on screen
+const CHAR_SCALE = 0.22;
+const CHAR_W = FRAME_W * CHAR_SCALE;   // ~44px
+const CHAR_H = FRAME_H * CHAR_SCALE;   // ~48px
+
+// Map drawn at this fraction of original size
+const MAP_SCALE = 0.75;
+
+const SPEED    = 3;
+const ANIM_FPS = 10;
+
+// Start position in world/screen coords (scaled map space)
+// world = mask_pixel * MAP_SCALE
+let playerX = 430 * MAP_SCALE;   // ~322
+let playerY = 445 * MAP_SCALE;   // ~334
+
+let CANVAS_W = window.innerWidth;
+let CANVAS_H = window.innerHeight;
+
+// ─── DIRECTIONS ────────────────────────────────────────────────────────────
+const DIR = { UP: 0, DOWN: 1, RIGHT: 2, LEFT: 3 };
+const SPRITE_ROW = { [DIR.UP]: 0, [DIR.DOWN]: 1, [DIR.RIGHT]: 2, [DIR.LEFT]: 2 };
+
+// ─── STATE ─────────────────────────────────────────────────────────────────
+let direction = DIR.DOWN;
+let frameIndex = 0;
+let frameTimer = 0;
+let moving = false;
+let keys = {};
+
+// ─── CANVAS ────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('game');
+const ctx    = canvas.getContext('2d');
+canvas.width  = CANVAS_W;
+canvas.height = CANVAS_H;
+
+window.addEventListener('resize', () => {
+  CANVAS_W = canvas.width  = window.innerWidth;
+  CANVAS_H = canvas.height = window.innerHeight;
+});
+
+// ─── ASSETS ────────────────────────────────────────────────────────────────
+const mapImg    = new Image();
+const spriteImg = new Image();
+const maskImg   = new Image();
+
+// Offscreen canvas for collision — drawn at MAP_SCALE so world coords map 1:1
+const maskCanvas = document.createElement('canvas');
+const maskCtx    = maskCanvas.getContext('2d', { willReadFrequently: true });
+
+// Offscreen canvas to strip black background from sprite sheet
+const spriteCanvas = document.createElement('canvas');
+const spriteCtx    = spriteCanvas.getContext('2d');
+
+let assetsLoaded = 0;
+const loadBar = document.getElementById('loadbar');
+
+function assetLoaded() {
+  assetsLoaded++;
+  loadBar.style.width = (assetsLoaded / 3 * 100) + '%';
+  if (assetsLoaded < 3) return;
+
+  // ── Collision mask: draw at MAP_SCALE so world coords = mask coords
+  maskCanvas.width  = Math.round(MAP_W * MAP_SCALE);
+  maskCanvas.height = Math.round(MAP_H * MAP_SCALE);
+  maskCtx.drawImage(maskImg, 0, 0, maskCanvas.width, maskCanvas.height);
+
+  // ── Sprite: remove black background
+  spriteCanvas.width  = spriteImg.naturalWidth;
+  spriteCanvas.height = spriteImg.naturalHeight;
+  spriteCtx.drawImage(spriteImg, 0, 0);
+
+  // Sheet already has transparent background - no processing needed
+
+  setTimeout(() => {
+    const el = document.getElementById('loading');
+    el.style.opacity = '0';
+    setTimeout(() => el.style.display = 'none', 500);
+    requestAnimationFrame(gameLoop);
+  }, 300);
+}
+
+mapImg.onload    = assetLoaded;
+spriteImg.onload = assetLoaded;
+maskImg.onload   = assetLoaded;
+
+mapImg.src    = 'GAME_MAP.png';
+spriteImg.src = 'Space_Engineer_Walk_Cycle1.png';
+maskImg.src   = 'walkable_space.png';
+
+// ─── COLLISION ─────────────────────────────────────────────────────────────
+// World coords ARE already in scaled-map space, so sample mask directly
+function isWalkable(wx, wy) {
+  const mx = Math.round(wx);
+  const my = Math.round(wy);
+  if (mx < 0 || my < 0 || mx >= maskCanvas.width || my >= maskCanvas.height) return false;
+  try {
+    return maskCtx.getImageData(mx, my, 1, 1).data[0] < 60;
+  } catch(e) { return false; }
+}
+
+// Check a grid of points around the player's lower body
+function canMoveTo(wx, wy) {
+  const hw = CHAR_W * 0.28;   // half-width of collision box
+  const ht = CHAR_H * 0.22;   // half-height of collision box (feet area)
+  const cy = wy + CHAR_H * 0.22; // centre of collision box, shifted to lower half
+
+  return (
+    isWalkable(wx - hw, cy - ht) &&
+    isWalkable(wx,      cy - ht) &&
+    isWalkable(wx + hw, cy - ht) &&
+    isWalkable(wx - hw, cy)      &&
+    isWalkable(wx,      cy)      &&
+    isWalkable(wx + hw, cy)      &&
+    isWalkable(wx - hw, cy + ht) &&
+    isWalkable(wx,      cy + ht) &&
+    isWalkable(wx + hw, cy + ht)
+  );
+}
+
+// ─── INPUT ─────────────────────────────────────────────────────────────────
+window.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.key] = false; });
+
+// ─── GAME LOOP ─────────────────────────────────────────────────────────────
+let lastTime = 0;
+
+function gameLoop(ts) {
+  const dt = Math.min((ts - lastTime) / 1000, 0.05);
+  lastTime = ts;
+  update(dt);
+  render();
+  requestAnimationFrame(gameLoop);
+}
+
+function update(dt) {
+  const up    = keys['ArrowUp']    || keys['w'];
+  const down  = keys['ArrowDown']  || keys['s'];
+  const left  = keys['ArrowLeft']  || keys['a'];
+  const right = keys['ArrowRight'] || keys['d'];
+
+  moving = !!(up || down || left || right);
+
+  let dx = 0, dy = 0;
+  if (up)    { dy = -SPEED; direction = DIR.UP;    }
+  if (down)  { dy =  SPEED; direction = DIR.DOWN;  }
+  if (left)  { dx = -SPEED; direction = DIR.LEFT;  }
+  if (right) { dx =  SPEED; direction = DIR.RIGHT; }
+
+  if (dx !== 0 && dy !== 0) { dx *= 0.707; dy *= 0.707; }
+
+  const nx = playerX + dx;
+  const ny = playerY + dy;
+
+  if      (canMoveTo(nx, ny))      { playerX = nx; playerY = ny; }
+  else if (canMoveTo(nx, playerY)) { playerX = nx; }
+  else if (canMoveTo(playerX, ny)) { playerY = ny; }
+
+  if (moving) {
+    frameTimer += dt;
+    if (frameTimer >= 1 / ANIM_FPS) {
+      frameTimer -= 1 / ANIM_FPS;
+      frameIndex = (frameIndex + 1) % SPRITE_COLS;
+    }
+  } else {
+    frameIndex = 0;
+    frameTimer = 0;
+  }
+}
+
+function render() {
+  ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+
+  // Camera always centres on player
+  const camX = Math.round(CANVAS_W / 2 - playerX);
+  const camY = Math.round(CANVAS_H / 2 - playerY);
+
+  ctx.save();
+  ctx.translate(camX, camY);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+
+  // Draw map
+  ctx.drawImage(mapImg, 0, 0, MAP_W * MAP_SCALE, MAP_H * MAP_SCALE);
+
+  // Draw sprite from the de-blacked offscreen canvas
+  const row = SPRITE_ROW[direction];
+  const sx  = frameIndex * FRAME_W;
+  const sy  = row * FRAME_H;
+  const drawX = playerX - CHAR_W / 2;
+  const drawY = playerY - CHAR_H / 2;
+
+  if (direction === DIR.LEFT) {
+    ctx.save();
+    ctx.translate(playerX, playerY);
+    ctx.scale(-1, 1);
+    ctx.drawImage(spriteCanvas, sx, sy, FRAME_W, FRAME_H, -CHAR_W/2, -CHAR_H/2, CHAR_W, CHAR_H);
+    ctx.restore();
+  } else {
+    ctx.drawImage(spriteCanvas, sx, sy, FRAME_W, FRAME_H, drawX, drawY, CHAR_W, CHAR_H);
+  }
+
+  ctx.restore();
+}
+</script>
+</body>
+</html>
